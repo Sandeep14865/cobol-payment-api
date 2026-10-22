@@ -39,7 +39,7 @@ The one idea to hold on to: **the copybook is the contract**. COBOL sees the req
 | `make build` | Runs `cobc -x -Wall -I cobol/copybooks -o bin/X cobol/X.cbl` for each program. `-x` = build an executable with a `main`; `-Wall` = all warnings; `-I` = where `COPY` finds copybooks; `-o` = output path. Rebuilds when a `.cbl` or any `.cpy` changes. | Compile + link JCL step with `SYSLIB` pointing at the copybook PDS |
 | `make seed` | Runs `bin/ACCTLOAD` with `DD_SEEDFILE` and `DD_ACCTFILE` set. It replaces `data/ACCOUNTS.DAT` with the three demo accounts. | An IDCAMS `DEFINE CLUSTER` + `REPRO` job that loads a KSDS |
 | `make run` | Starts Uvicorn on port 8000 with `--reload` (restarts on Python changes). | Starting the z/OS Connect Liberty server |
-| `make test` | Runs `tests/curl_tests.sh`, 11 calls with expected outcomes in their titles. | — |
+| `make test` | Runs `tests/curl_tests.sh`, 17 calls (11 payments, 6 balance inquiries) with expected outcomes in their titles. | — |
 | `make clean` | Deletes `bin/` and the indexed file. | — |
 | `curl -s -X POST URL -H 'Content-Type: application/json' -d '{...}'` | `-s` silent, `-X POST` the method, `-H` tells FastAPI the body is JSON, `-d` the body. The test script adds `-w '%{http_code}'` to print the HTTP status. | Any REST client |
 
@@ -102,6 +102,16 @@ Return codes follow the mainframe batch convention: 0 OK, 4 warning, 8 error, 12
 
 Why stdout is "sacred": the response must be exactly one 94-character line. A stray `DISPLAY "DEBUG..."` would break the record, and the API would correctly refuse it (see scenario 5.6). Diagnostics go to stderr, which Python logs separately. That mirrors the split between a CICS COMMAREA (data) and the job log / `SYSOUT` (messages).
 
+### `cobol/copybooks/BALREQ.cpy` and `BALRSP.cpy` — balance inquiry records
+
+`BALREQ` is just the 10-character account number. `BALRSP` (121 characters) carries status, reason code, message, account, name (`X(30)`), account status (`X(1)`, `A` or `F`), balance (`S9(11)V99` with separate sign) and `BRS-AS-OF` (`X(14)`, `YYYYMMDDHHMMSS`). The timestamp is text, not a date type: COBOL has no native date field in a record, so the format is part of the contract, and the API turns it into ISO 8601.
+
+### `cobol/BALINQ.cbl` — balance inquiry
+
+A second, read-only program. It checks the account is numeric (E001), opens the account file for `INPUT` (not `I-O`: it can't change anything), reads by key (E006 if not found), and moves the name, status and `COMP-3` balance into the `DISPLAY` response fields, plus the time it read them. Return codes: 0 found, 8 rejected or not found, 12 file error.
+
+Why a separate program instead of a "B" type in `PAYMENT`? Each program does one job and has its own contract. On a mainframe this would be its own CICS transaction, so read-only inquiries can be given different security and run without update locks. A frozen account is still `FOUND`: the freeze stops payments, not looking.
+
 ### `cobol/ACCTLOAD.cbl` — loads the account file
 
 Reads `data/accounts.seed` (line sequential), moves each field into `ACCOUNT-RECORD` (the `MOVE` of the `SIGN LEADING SEPARATE` seed balance into the `COMP-3` balance is the conversion), and `WRITE`s it. `OPEN OUTPUT` on an indexed file replaces it. Records must be in ascending key order because the file is opened for sequential access.
@@ -137,7 +147,9 @@ Pydantic models are the API's equivalent of the copybook: they describe the JSON
 - **Here**: anything needed to build a valid record. `max_length=10` (it must fit `PIC X(10)`), `max_digits=11, decimal_places=2` (it must fit `S9(9)V99`), `type` must be `DEBIT` or `CREDIT` (there is no other code to send), and `extra="forbid"` (unknown JSON keys are an error, not silently dropped).
 - **In COBOL**: business rules. Is the account all digits? Is the amount positive? Under the limit? Funded? Those can change without touching the API, and other callers of `PAYMENT` (a batch job, a CICS screen) get the same rules.
 
-`new_balance` and `ref_no` are optional (`| None`) because they mean something only when the payment is approved.
+`new_balance` and `ref_no` are optional (`| None`) because they mean something only when the payment is approved. In `BalanceResponse`, `name`, `account_status`, `balance` and `as_of` are optional for the same reason: they exist only when the account is `FOUND`.
+
+The balance endpoint has no request model: the account comes from the URL, and `main.py` limits it to 10 characters with `Path(min_length=1, max_length=10)`.
 
 ### `app/copybook.py` — the copybook, in Python
 
@@ -147,14 +159,16 @@ It deliberately **raises** instead of truncating: a too-long string, a third dec
 
 ### `app/cobol_bridge.py` — the subprocess call
 
-`call_payment()`:
+`call_payment()` and `call_balance_inquiry()` are one-liners that pass a program and its two layouts to `_run_program()`, which:
 
 1. Encodes the request record.
-2. Takes `_payment_lock`, so only one `PAYMENT` runs at a time (it does read → check → rewrite, which must not interleave).
-3. `subprocess.run([bin/PAYMENT], input=record+"\n", capture_output=True, text=True, encoding="ascii", timeout=5, env={..., DD_ACCTFILE})`.
-4. Logs each stderr line.
+2. Takes `_account_file_lock`, so only one COBOL program uses the account file at a time. `PAYMENT` does read → check → rewrite, which must not interleave with another payment, and `BALINQ` takes the same lock so it never reads in the middle of a payment.
+3. `subprocess.run([program], input=record+"\n", capture_output=True, text=True, encoding="ascii", timeout=5, env={..., DD_ACCTFILE})`.
+4. Logs each stderr line, labelled with the program name.
 5. Rejects any exit status other than 0/4/8/12 (a crash or a `libcob` runtime error).
-6. Strips only the trailing newline (trailing spaces are data) and decodes 94 characters. Wrong length = `CobolCallError`.
+6. Strips only the trailing newline (trailing spaces are data) and decodes the response (94 or 121 characters). Wrong length = `CobolCallError`.
+
+Adding a third COBOL program would mean two layouts in `copybook.py`, one more one-line function here, and a route in `main.py`.
 
 Every failure becomes a `CobolCallError`, which `main.py` turns into HTTP 503.
 
@@ -166,11 +180,18 @@ Every failure becomes a `CobolCallError`, which `main.py` turns into HTTP 503.
 2. **Call**: `RecordMappingError` → 422; `CobolCallError` → 503.
 3. **COBOL names → JSON**: `RSP-STATUS → status` and so on. `new_balance` only when approved; blank `ref_no` → `null`. `HTTP_STATUS` picks the HTTP code from `RSP-STATUS`.
 
-`GET /health` reports whether the binary and the data file exist.
+`GET /accounts/{account}/balance` follows the same three steps with `BALREQ`/`BALRSP`, and shows two more kinds of mapping:
+
+- **Code → enum**: `BRS-ACCT-STATUS` `A`/`F` becomes `"ACTIVE"`/`"FROZEN"` via `ACCOUNT_STATUS_NAMES`, the reverse of what `TYPE_CODES` does for requests.
+- **Text → date**: `BRS-AS-OF` `20261022204203` becomes `"2026-10-22T20:42:03"` with `datetime.strptime(..., "%Y%m%d%H%M%S")`.
+
+If either fails (an unknown status code, an unreadable timestamp), the reply is treated as a bad record: 503, cause in the log. `FOUND` maps to HTTP 200, the other statuses as for payments.
+
+`GET /health` reports whether `bin/PAYMENT`, `bin/BALINQ` and the data file exist.
 
 ### `tests/curl_tests.sh`
 
-Eleven calls: two approvals, every COBOL reason code reachable through the API, and three requests that Pydantic rejects before COBOL ever runs.
+Seventeen calls. Payments: two approvals, every COBOL reason code reachable through the API, and three requests that Pydantic rejects before COBOL ever runs. Balances: before and after the payments (showing 1,500.00 then 1,449.00), a frozen account, an unknown account, a non-numeric account, and an account number too long for the URL check.
 
 ---
 
@@ -252,7 +273,7 @@ Each scenario lists what happens in the demo, which layer owns it, and how it pl
 
 **5.6 Copybook drift.** Someone widens `RSP-MESSAGE` to `X(60)` and redeploys only COBOL. The reply is now 114 characters; `PAYRSP.decode` raises, the API answers 503, nothing is mis-mapped. Without the length check, every field after the message would be shifted 20 characters and the balance could be read from the wrong bytes. On z/OS Connect the service must be regenerated from the new copybook; a stale mapping produces the same misalignment (or a length error, depending on settings). `JSON GENERATE` cannot drift, because it compiles against the copybook itself.
 
-**5.7 Concurrent payments.** Twenty parallel `curl` credits of 1.00 to Bob (25.00) end at exactly 45.00: `_payment_lock` serialises the read–rewrite. Without it, two runs could both read 25.00 and both write 26.00 (a lost update). The lock only works inside one Python process; with `uvicorn --workers 4` you would need a lock the processes share, or record locking in the data layer. CICS gives you that with `READ UPDATE`, which holds the record until `REWRITE` or task end; VSAM RLS does the same across systems.
+**5.7 Concurrent payments.** Twenty parallel `curl` credits of 1.00 to Bob (25.00) end at exactly 45.00: `_account_file_lock` serialises the read–rewrite. Balance inquiries mixed in with the payments take the same lock, so each one sees a balance from before or after a payment, never in between. Without it, two runs could both read 25.00 and both write 26.00 (a lost update). The lock only works inside one Python process; with `uvicorn --workers 4` you would need a lock the processes share, or record locking in the data layer. CICS gives you that with `READ UPDATE`, which holds the record until `REWRITE` or task end; VSAM RLS does the same across systems.
 
 **5.8 Non-ASCII input.** `"account":"10000é0001"` is 10 characters and passes Pydantic, but `copybook.py` refuses it (422) because the record is ASCII. On z/OS the question becomes "does this character exist in the EBCDIC code page?", and z/OS Connect raises a conversion error.
 
@@ -307,7 +328,7 @@ Five scenarios, no answers. Work each one out against the code before checking b
 
 2. **The widened field.** The COBOL team changes `RSP-MESSAGE` to `PIC X(60)`, rebuilds `bin/PAYMENT`, and does not touch Python. Which exact line raises an exception, what HTTP status and body does the client get, and does the payment still post? What would happen with `PAYJSON.cbl` after the same change, and with a z/OS Connect service built from the old copybook?
 
-3. **Four workers.** You start the API with `uvicorn app.main:app --workers 4` and fire 100 concurrent 10.00 debits at an account holding 500.00. What final balances are possible, why does `_payment_lock` not prevent it, and what would you change in `PAYMENT.cbl` (or in the data store) to fix it? What is the CICS equivalent of your fix?
+3. **Four workers.** You start the API with `uvicorn app.main:app --workers 4` and fire 100 concurrent 10.00 debits at an account holding 500.00. What final balances are possible, why does `_account_file_lock` not prevent it, and what would you change in `PAYMENT.cbl` (or in the data store) to fix it? What is the CICS equivalent of your fix?
 
 4. **The move to z/OS.** The program is ported to CICS: `ACCOUNTS.DAT` becomes a VSAM KSDS, the request arrives as a COMMAREA through z/OS Connect, and `REQ-AMOUNT` is changed to `PIC S9(9)V99 COMP-3`. Which files in this repository disappear, which become generated artifacts, and which survive unchanged? Write out the hex bytes of `REQ-AMOUNT` for a 125.50 request, and say what `ACCEPT`, `DISPLAY` and `STOP RUN` turn into.
 

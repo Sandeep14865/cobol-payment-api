@@ -1,4 +1,5 @@
-"""Python mirror of the COBOL copybooks PAYREQ and PAYRSP.
+"""Python mirror of the COBOL interface copybooks (PAYREQ, PAYRSP,
+BALREQ, BALRSP).
 
 Each Field says how wide a COBOL field is and how its characters are
 encoded. Fields are laid out back to back in the order given, exactly
@@ -102,4 +103,23 @@ PAYRSP = Layout(
     Field("RSP-ACCOUNT", 10, "X"),
     Field("RSP-NEW-BALANCE", 14, "S9V", scale=2),  # S9(11)V99 + sign
     Field("RSP-REF-NO", 18, "X"),
+)
+
+# cobol/copybooks/BALREQ.cpy (10 characters)
+BALREQ = Layout(
+    "BALANCE-REQUEST",
+    Field("BRQ-ACCOUNT", 10, "X"),
+)
+
+# cobol/copybooks/BALRSP.cpy (121 characters)
+BALRSP = Layout(
+    "BALANCE-RESPONSE",
+    Field("BRS-STATUS", 8, "X"),
+    Field("BRS-REASON-CODE", 4, "X"),
+    Field("BRS-MESSAGE", 40, "X"),
+    Field("BRS-ACCOUNT", 10, "X"),
+    Field("BRS-NAME", 30, "X"),
+    Field("BRS-ACCT-STATUS", 1, "X"),
+    Field("BRS-BALANCE", 14, "S9V", scale=2),  # S9(11)V99 + sign
+    Field("BRS-AS-OF", 14, "X"),  # YYYYMMDDHHMMSS
 )

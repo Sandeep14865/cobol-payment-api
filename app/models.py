@@ -1,6 +1,7 @@
 """JSON shapes of the API. Pydantic checks structure (types, sizes that
 must fit the COBOL fields); business rules stay in COBOL."""
 
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Literal
@@ -32,3 +33,20 @@ class PaymentResponse(BaseModel):
     account: str
     new_balance: Decimal | None  # only set when APPROVED
     ref_no: str | None  # only set when APPROVED
+
+
+class AccountStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    FROZEN = "FROZEN"
+
+
+class BalanceResponse(BaseModel):
+    status: Literal["FOUND", "REJECTED", "NOTFOUND", "ERROR"]
+    reason_code: str
+    message: str
+    account: str
+    # The rest are only set when FOUND
+    name: str | None
+    account_status: AccountStatus | None
+    balance: Decimal | None
+    as_of: datetime | None  # when COBOL read the balance (server local time)

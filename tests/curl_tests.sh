@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
-# Calls POST /payment with one request per scenario and prints the HTTP
-# status and JSON body. Run "make seed" first for the expected balances.
+# Calls GET /accounts/{account}/balance and POST /payment with one
+# request per scenario and prints the HTTP status and JSON body.
+# Run "make seed" first for the expected balances.
 # Usage: ./tests/curl_tests.sh [base-url]
 
 BASE="${1:-http://127.0.0.1:8000}"
+
+get() {
+  local title="$1" account="$2"
+  echo "== $title"
+  echo "   request : GET /accounts/$account/balance"
+  curl -s -w '\n   http    : %{http_code}\n' "$BASE/accounts/$account/balance" \
+    | sed '1s/^/   response: /'
+  echo
+}
 
 call() {
   local title="$1" body="$2"
@@ -13,6 +23,8 @@ call() {
     -H 'Content-Type: application/json' -d "$body" | sed '1s/^/   response: /'
   echo
 }
+
+get  "B1. Balance before payments (1500.00)" 1000000001
 
 call "1. Debit approved (1500.00 - 125.50)" '{"account":"1000000001","amount":125.50,"type":"DEBIT"}'
 call "2. Credit approved"                   '{"account":"1000000001","amount":"74.50","type":"CREDIT"}'
@@ -25,3 +37,9 @@ call "8. Over single-payment limit (E005)"  '{"account":"1000000001","amount":10
 call "9. Three decimals (Pydantic)"         '{"account":"1000000001","amount":1.005,"type":"DEBIT"}'
 call "10. Unknown type (Pydantic)"          '{"account":"1000000001","amount":1,"type":"REFUND"}'
 call "11. Account too long (Pydantic)"      '{"account":"10000000011","amount":1,"type":"DEBIT"}'
+
+get  "B2. Balance after payments (1449.00)"  1000000001
+get  "B3. Frozen account (balance still shown)" 1000000003
+get  "B4. Unknown account (E006)"            9999999999
+get  "B5. Account not numeric (E001)"        ABC1234567
+get  "B6. Account too long (FastAPI)"        10000000011

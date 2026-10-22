@@ -1,4 +1,4 @@
-"""Runs the COBOL PAYMENT program as a subprocess.
+"""Runs the COBOL programs (PAYMENT, BALINQ) as subprocesses.
 
 One request record goes in on stdin, one response record comes back on
 stdout, and the exit status carries the COBOL RETURN-CODE.
@@ -11,20 +11,23 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .copybook import PAYREQ, PAYRSP, RecordMappingError
+from .copybook import BALREQ, BALRSP, PAYREQ, PAYRSP, Layout, RecordMappingError
 
 log = logging.getLogger("cobol_bridge")
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 PAYMENT_BIN = Path(os.environ.get("PAYMENT_BIN", PROJECT_DIR / "bin" / "PAYMENT"))
+BALINQ_BIN = Path(os.environ.get("BALINQ_BIN", PROJECT_DIR / "bin" / "BALINQ"))
 ACCOUNT_FILE = Path(os.environ.get("DD_ACCTFILE", PROJECT_DIR / "data" / "ACCOUNTS.DAT"))
 TIMEOUT_SECONDS = 5
 KNOWN_RETURN_CODES = {0, 4, 8, 12}
 
 # PAYMENT reads a balance, checks it and rewrites it. Two runs at once
-# could both read the same old balance, so only one runs at a time.
+# could both read the same old balance, so only one program touches the
+# account file at a time. BALINQ takes the lock too, so an inquiry never
+# reads a record halfway through a payment.
 # This lock covers one API process; see GUIDE.md for multi-process.
-_payment_lock = threading.Lock()
+_account_file_lock = threading.Lock()
 
 
 class CobolCallError(RuntimeError):
@@ -38,15 +41,24 @@ class CobolResult:
 
 
 def call_payment(request_fields: dict) -> CobolResult:
-    record = PAYREQ.encode(request_fields)  # may raise RecordMappingError
+    return _run_program(PAYMENT_BIN, PAYREQ, PAYRSP, request_fields)
+
+
+def call_balance_inquiry(request_fields: dict) -> CobolResult:
+    return _run_program(BALINQ_BIN, BALREQ, BALRSP, request_fields)
+
+
+def _run_program(program: Path, request: Layout, response: Layout, request_fields: dict) -> CobolResult:
+    name = program.name
+    record = request.encode(request_fields)  # may raise RecordMappingError
 
     # Map the logical file name ACCTFILE to a real path, like a JCL DD.
     env = {**os.environ, "DD_ACCTFILE": str(ACCOUNT_FILE)}
 
-    with _payment_lock:
+    with _account_file_lock:
         try:
             proc = subprocess.run(
-                [str(PAYMENT_BIN)],
+                [str(program)],
                 input=record + "\n",
                 capture_output=True,
                 text=True,
@@ -55,23 +67,23 @@ def call_payment(request_fields: dict) -> CobolResult:
                 env=env,
             )
         except FileNotFoundError:
-            raise CobolCallError(f"{PAYMENT_BIN} not found; run 'make build'")
+            raise CobolCallError(f"{program} not found; run 'make build'")
         except subprocess.TimeoutExpired:
-            raise CobolCallError(f"PAYMENT did not finish in {TIMEOUT_SECONDS}s")
+            raise CobolCallError(f"{name} did not finish in {TIMEOUT_SECONDS}s")
         except UnicodeDecodeError:
-            raise CobolCallError("PAYMENT wrote non-ASCII output")
+            raise CobolCallError(f"{name} wrote non-ASCII output")
 
     for line in proc.stderr.splitlines():
-        log.info("PAYMENT stderr: %s", line)
+        log.info("%s stderr: %s", name, line)
 
     if proc.returncode not in KNOWN_RETURN_CODES:
-        raise CobolCallError(f"PAYMENT ended with unexpected exit status {proc.returncode}")
+        raise CobolCallError(f"{name} ended with unexpected exit status {proc.returncode}")
 
     # Strip only the newline: trailing spaces are part of the record.
     out = proc.stdout.rstrip("\n")
     try:
-        fields = PAYRSP.decode(out)
+        fields = response.decode(out)
     except RecordMappingError as e:
-        raise CobolCallError(f"bad response record: {e}")
+        raise CobolCallError(f"bad response record from {name}: {e}")
 
     return CobolResult(proc.returncode, fields)

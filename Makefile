@@ -12,7 +12,7 @@ export DD_SEEDFILE = $(CURDIR)/data/accounts.seed
 
 .PHONY: build seed run test clean
 
-build: $(BIN)/PAYMENT $(BIN)/ACCTLOAD $(BIN)/PAYJSON
+build: $(BIN)/PAYMENT $(BIN)/BALINQ $(BIN)/ACCTLOAD $(BIN)/PAYJSON
 
 $(BIN)/%: cobol/%.cbl cobol/copybooks/*.cpy
 	@mkdir -p $(BIN)
